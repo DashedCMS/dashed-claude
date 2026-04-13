@@ -10,6 +10,7 @@ use Filament\Forms\Components\TextInput;
 use Dashed\DashedAi\Exceptions\AiException;
 use Dashed\DashedCore\Models\Customsetting;
 use Dashed\DashedAi\Exceptions\AiRateLimitException;
+use Dashed\DashedAi\Exceptions\EmbeddingNotSupportedException;
 
 class ClaudeProvider extends AiProvider
 {
@@ -140,6 +141,11 @@ class ClaudeProvider extends AiProvider
     public function image(string $prompt, array $options = []): ?string
     {
         return null;
+    }
+
+    public function embed(string $text, array $options = []): array
+    {
+        throw EmbeddingNotSupportedException::forProvider('claude');
     }
 
     public function settingsSchema(): array
