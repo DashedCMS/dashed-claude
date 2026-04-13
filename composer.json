@@ -1,0 +1,36 @@
+{
+    "name": "dashed/dashed-claude",
+    "description": "Claude (Anthropic) provider for Dashed AI",
+    "keywords": ["Dashed", "laravel", "dashed-claude", "anthropic", "claude"],
+    "homepage": "https://github.com/Dashed-DEV/dashed-claude",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Robin van Maasakker",
+            "email": "robin@dashed.nl",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": "^8.4",
+        "dashed/dashed-ai": "*",
+        "spatie/laravel-package-tools": "^1.16"
+    },
+    "autoload": {
+        "psr-4": {
+            "Dashed\\DashedClaude\\": "src"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Dashed\\DashedClaude\\DashedClaudeServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
