@@ -91,8 +91,8 @@ class ClaudeProvider extends AiProvider
         }
 
         $body = [
-            'model' => self::MODEL,
-            'max_tokens' => $options['max_tokens'] ?? 200,
+            'model' => $options['model'] ?? self::MODEL,
+            'max_tokens' => $options['max_tokens'] ?? 1024,
             'messages' => [[
                 'role' => 'user',
                 'content' => [
@@ -108,6 +108,10 @@ class ClaudeProvider extends AiProvider
                 ],
             ]],
         ];
+
+        if (isset($options['temperature'])) {
+            $body['temperature'] = (float) $options['temperature'];
+        }
 
         $system = $this->buildSystemPrompt($options);
         if ($system) {
@@ -182,10 +186,14 @@ class ClaudeProvider extends AiProvider
         }
 
         $body = [
-            'model' => self::MODEL,
+            'model' => $options['model'] ?? self::MODEL,
             'max_tokens' => $options['max_tokens'] ?? 4000,
             'messages' => [['role' => 'user', 'content' => $prompt]],
         ];
+
+        if (isset($options['temperature'])) {
+            $body['temperature'] = (float) $options['temperature'];
+        }
 
         $system = $this->buildSystemPrompt($options);
         if ($system) {
