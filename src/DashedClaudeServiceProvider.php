@@ -17,15 +17,17 @@ class DashedClaudeServiceProvider extends PackageServiceProvider
 
     public function bootingPackage(): void
     {
-        cms()->registerIntegration([
-            'slug' => 'anthropic',
-            'label' => 'Anthropic Claude',
-            'icon' => 'heroicon-o-sparkles',
-            'category' => 'ai',
-            'settings_page' => \Dashed\DashedAi\Filament\Pages\Settings\AiSettingsPage::class,
-            'health_check' => fn (?string $siteId = null) => \Dashed\DashedCore\Integrations\IntegrationHealth::fromSettings(['claude_api_key'], $siteId, 'API key ontbreekt'),
-            'package' => 'dashed-claude',
-        ]);
+        if (method_exists(cms(), 'registerIntegration')) {
+            cms()->registerIntegration([
+                'slug' => 'anthropic',
+                'label' => 'Anthropic Claude',
+                'icon' => 'heroicon-o-sparkles',
+                'category' => 'ai',
+                'settings_page' => \Dashed\DashedAi\Filament\Pages\Settings\AiSettingsPage::class,
+                'health_check' => fn (?string $siteId = null) => \Dashed\DashedCore\Integrations\IntegrationHealth::fromSettings(['claude_api_key'], $siteId, 'API key ontbreekt'),
+                'package' => 'dashed-claude',
+            ]);
+        }
 
         app(AiManager::class)->register(new ClaudeProvider());
     }
