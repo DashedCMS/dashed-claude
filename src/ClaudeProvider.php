@@ -199,68 +199,68 @@ class ClaudeProvider extends AiProvider
             'stream' => true,
         ], fn ($v) => $v !== null);
 
-        $response = Http::withHeaders($this->headers($apiKey))->timeout(120)
+        $response = Http::withOptions(['stream' => true])
+            ->withHeaders($this->headers($apiKey))
+            ->timeout(120)
             ->post('https://api.anthropic.com/v1/messages', $payload);
 
+        if ($response->status() === 429) {
+            throw new AiRateLimitException('Claude stream rate limit.');
+        }
         if (! $response->successful()) {
             throw new AiException('Claude stream fout: ' . $response->status());
         }
 
-        return $this->parseSse($response->body(), $onText);
-    }
+        $state = [
+            'text' => '',
+            'stopReason' => null,
+            'usage' => ['input_tokens' => 0, 'output_tokens' => 0],
+            'tools' => [],
+        ];
 
-    protected function parseSse(string $body, callable $onText): array
-    {
-        $text = '';
-        $stopReason = null;
-        $usage = ['input_tokens' => 0, 'output_tokens' => 0];
-        $tools = [];
+        $leftover = '';
 
-        foreach (preg_split('/\n\n/', trim($body)) as $event) {
-            if (! str_contains($event, 'data:')) {
-                continue;
+        try {
+            $body = $response->toPsrResponse()->getBody();
+            while (! $body->eof()) {
+                $chunk = $body->read(8192);
+                if ($chunk === '' || $chunk === false) {
+                    continue;
+                }
+                $leftover .= $chunk;
+                $events = explode("\n\n", $leftover);
+                // The last element may be incomplete; keep it as leftover.
+                $leftover = array_pop($events);
+                foreach ($events as $event) {
+                    $this->parseSseEvent($event, $state, $onText);
+                }
             }
-            $json = trim(substr($event, strpos($event, 'data:') + 5));
-            $data = json_decode($json, true);
-            if (! is_array($data)) {
-                continue;
+            // Process any remaining data after EOF.
+            if ($leftover !== '') {
+                foreach (explode("\n\n", $leftover) as $event) {
+                    $this->parseSseEvent($event, $state, $onText);
+                }
             }
-
-            switch ($data['type'] ?? null) {
-                case 'message_start':
-                    $usage['input_tokens'] = $data['message']['usage']['input_tokens'] ?? 0;
-                    break;
-                case 'content_block_start':
-                    if (($data['content_block']['type'] ?? null) === 'tool_use') {
-                        $tools[$data['index']] = [
-                            'type' => 'tool_use',
-                            'id' => $data['content_block']['id'],
-                            'name' => $data['content_block']['name'],
-                            'input_json' => '',
-                        ];
-                    }
-                    break;
-                case 'content_block_delta':
-                    $delta = $data['delta'] ?? [];
-                    if (($delta['type'] ?? null) === 'text_delta') {
-                        $text .= $delta['text'];
-                        $onText($delta['text']);
-                    } elseif (($delta['type'] ?? null) === 'input_json_delta' && isset($tools[$data['index']])) {
-                        $tools[$data['index']]['input_json'] .= $delta['partial_json'] ?? '';
-                    }
-                    break;
-                case 'message_delta':
-                    $stopReason = $data['delta']['stop_reason'] ?? $stopReason;
-                    $usage['output_tokens'] = $data['usage']['output_tokens'] ?? $usage['output_tokens'];
-                    break;
+        } catch (\Throwable $e) {
+            // If PSR streaming is not available (e.g. Http::fake in tests),
+            // fall back to parsing the full body at once.
+            $fallback = $response->body();
+            $state = [
+                'text' => '',
+                'stopReason' => null,
+                'usage' => ['input_tokens' => 0, 'output_tokens' => 0],
+                'tools' => [],
+            ];
+            foreach (explode("\n\n", $fallback) as $event) {
+                $this->parseSseEvent($event, $state, $onText);
             }
         }
 
         $content = [];
-        if ($text !== '') {
-            $content[] = ['type' => 'text', 'text' => $text];
+        if ($state['text'] !== '') {
+            $content[] = ['type' => 'text', 'text' => $state['text']];
         }
-        foreach ($tools as $t) {
+        foreach ($state['tools'] as $t) {
             $content[] = [
                 'type' => 'tool_use',
                 'id' => $t['id'],
@@ -269,7 +269,97 @@ class ClaudeProvider extends AiProvider
             ];
         }
 
-        return ['stop_reason' => $stopReason, 'content' => $content, 'usage' => $usage];
+        $result = [
+            'stop_reason' => $state['stopReason'],
+            'content' => $content,
+            'usage' => $state['usage'],
+        ];
+
+        $this->trackUsage($result['usage']['input_tokens'] ?? 0, $result['usage']['output_tokens'] ?? 0);
+
+        return $result;
+    }
+
+    /**
+     * Parse a single SSE event block and mutate $state accordingly.
+     *
+     * @param array{text:string,stopReason:?string,usage:array,tools:array} $state
+     */
+    protected function parseSseEvent(string $event, array &$state, callable $onText): void
+    {
+        if (! str_contains($event, 'data:')) {
+            return;
+        }
+        $json = trim(substr($event, strpos($event, 'data:') + 5));
+        $data = json_decode($json, true);
+        if (! is_array($data)) {
+            return;
+        }
+
+        switch ($data['type'] ?? null) {
+            case 'message_start':
+                $state['usage']['input_tokens'] = $data['message']['usage']['input_tokens'] ?? 0;
+
+                break;
+            case 'content_block_start':
+                if (($data['content_block']['type'] ?? null) === 'tool_use') {
+                    $state['tools'][$data['index']] = [
+                        'type' => 'tool_use',
+                        'id' => $data['content_block']['id'],
+                        'name' => $data['content_block']['name'],
+                        'input_json' => '',
+                    ];
+                }
+
+                break;
+            case 'content_block_delta':
+                $delta = $data['delta'] ?? [];
+                if (($delta['type'] ?? null) === 'text_delta') {
+                    $state['text'] .= $delta['text'];
+                    $onText($delta['text']);
+                } elseif (($delta['type'] ?? null) === 'input_json_delta' && isset($state['tools'][$data['index']])) {
+                    $state['tools'][$data['index']]['input_json'] .= $delta['partial_json'] ?? '';
+                }
+
+                break;
+            case 'message_delta':
+                $state['stopReason'] = $data['delta']['stop_reason'] ?? $state['stopReason'];
+                $state['usage']['output_tokens'] = $data['usage']['output_tokens'] ?? $state['usage']['output_tokens'];
+
+                break;
+        }
+    }
+
+    /**
+     * @deprecated Use parseSseEvent with a $state array instead.
+     */
+    protected function parseSse(string $body, callable $onText): array
+    {
+        $state = [
+            'text' => '',
+            'stopReason' => null,
+            'usage' => ['input_tokens' => 0, 'output_tokens' => 0],
+            'tools' => [],
+        ];
+
+        foreach (explode("\n\n", $body) as $event) {
+            $this->parseSseEvent($event, $state, $onText);
+        }
+
+        $content = [];
+        if ($state['text'] !== '') {
+            $content[] = ['type' => 'text', 'text' => $state['text']];
+        }
+        foreach ($state['tools'] as $t) {
+            $content[] = [
+                'type' => 'tool_use',
+                'id' => $t['id'],
+                'name' => $t['name'],
+                'input' => json_decode($t['input_json'] ?: '{}', true) ?: [],
+            ];
+        }
+
+        return ['stop_reason' => $state['stopReason'], 'content' => $content, 'usage' => $state['usage']];
     }
 
     public function image(string $prompt, array $options = []): ?string
