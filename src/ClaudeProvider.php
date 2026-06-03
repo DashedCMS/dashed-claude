@@ -142,6 +142,45 @@ class ClaudeProvider extends AiProvider
         return null;
     }
 
+    public function messages(array $messages, array $options = []): array
+    {
+        $apiKey = $this->apiKey();
+        if (! $apiKey) {
+            throw new AiException('Geen Claude API key ingesteld.');
+        }
+
+        $payload = [
+            'model' => $options['model'] ?? static::MODEL,
+            'max_tokens' => $options['max_tokens'] ?? 1024,
+            'messages' => $messages,
+        ];
+        if (! empty($options['system'])) {
+            $payload['system'] = $options['system'];
+        }
+        if (! empty($options['tools'])) {
+            $payload['tools'] = $options['tools'];
+        }
+        if (! empty($options['tool_choice'])) {
+            $payload['tool_choice'] = $options['tool_choice'];
+        }
+        if (isset($options['temperature'])) {
+            $payload['temperature'] = $options['temperature'];
+        }
+
+        $response = Http::withHeaders($this->headers($apiKey))
+            ->timeout(120)
+            ->post('https://api.anthropic.com/v1/messages', $payload);
+
+        if ($response->status() === 429) {
+            throw new AiRateLimitException('Claude rate limit.');
+        }
+        if (! $response->successful()) {
+            throw new AiException('Claude fout: ' . $response->status() . ' ' . $response->body());
+        }
+
+        return $response->json();
+    }
+
     public function image(string $prompt, array $options = []): ?string
     {
         return null;
