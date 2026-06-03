@@ -181,6 +181,97 @@ class ClaudeProvider extends AiProvider
         return $response->json();
     }
 
+    public function streamMessages(array $messages, array $options, callable $onText): array
+    {
+        $apiKey = $this->apiKey();
+        if (! $apiKey) {
+            throw new AiException('Geen Claude API key.');
+        }
+
+        $payload = array_filter([
+            'model' => $options['model'] ?? static::MODEL,
+            'max_tokens' => $options['max_tokens'] ?? 1024,
+            'messages' => $messages,
+            'system' => $options['system'] ?? null,
+            'tools' => $options['tools'] ?? null,
+            'tool_choice' => $options['tool_choice'] ?? null,
+            'temperature' => $options['temperature'] ?? null,
+            'stream' => true,
+        ], fn ($v) => $v !== null);
+
+        $response = Http::withHeaders($this->headers($apiKey))->timeout(120)
+            ->post('https://api.anthropic.com/v1/messages', $payload);
+
+        if (! $response->successful()) {
+            throw new AiException('Claude stream fout: ' . $response->status());
+        }
+
+        return $this->parseSse($response->body(), $onText);
+    }
+
+    protected function parseSse(string $body, callable $onText): array
+    {
+        $text = '';
+        $stopReason = null;
+        $usage = ['input_tokens' => 0, 'output_tokens' => 0];
+        $tools = [];
+
+        foreach (preg_split('/\n\n/', trim($body)) as $event) {
+            if (! str_contains($event, 'data:')) {
+                continue;
+            }
+            $json = trim(substr($event, strpos($event, 'data:') + 5));
+            $data = json_decode($json, true);
+            if (! is_array($data)) {
+                continue;
+            }
+
+            switch ($data['type'] ?? null) {
+                case 'message_start':
+                    $usage['input_tokens'] = $data['message']['usage']['input_tokens'] ?? 0;
+                    break;
+                case 'content_block_start':
+                    if (($data['content_block']['type'] ?? null) === 'tool_use') {
+                        $tools[$data['index']] = [
+                            'type' => 'tool_use',
+                            'id' => $data['content_block']['id'],
+                            'name' => $data['content_block']['name'],
+                            'input_json' => '',
+                        ];
+                    }
+                    break;
+                case 'content_block_delta':
+                    $delta = $data['delta'] ?? [];
+                    if (($delta['type'] ?? null) === 'text_delta') {
+                        $text .= $delta['text'];
+                        $onText($delta['text']);
+                    } elseif (($delta['type'] ?? null) === 'input_json_delta' && isset($tools[$data['index']])) {
+                        $tools[$data['index']]['input_json'] .= $delta['partial_json'] ?? '';
+                    }
+                    break;
+                case 'message_delta':
+                    $stopReason = $data['delta']['stop_reason'] ?? $stopReason;
+                    $usage['output_tokens'] = $data['usage']['output_tokens'] ?? $usage['output_tokens'];
+                    break;
+            }
+        }
+
+        $content = [];
+        if ($text !== '') {
+            $content[] = ['type' => 'text', 'text' => $text];
+        }
+        foreach ($tools as $t) {
+            $content[] = [
+                'type' => 'tool_use',
+                'id' => $t['id'],
+                'name' => $t['name'],
+                'input' => json_decode($t['input_json'] ?: '{}', true) ?: [],
+            ];
+        }
+
+        return ['stop_reason' => $stopReason, 'content' => $content, 'usage' => $usage];
+    }
+
     public function image(string $prompt, array $options = []): ?string
     {
         return null;
