@@ -166,6 +166,9 @@ class ClaudeProvider extends AiProvider
         if (isset($options['temperature'])) {
             $payload['temperature'] = $options['temperature'];
         }
+        if (! empty($options['cache'])) {
+            $payload = $this->applyCacheControl($payload);
+        }
 
         $response = Http::withHeaders($this->headers($apiKey))
             ->timeout(120)
@@ -198,6 +201,10 @@ class ClaudeProvider extends AiProvider
             'temperature' => $options['temperature'] ?? null,
             'stream' => true,
         ], fn ($v) => $v !== null);
+
+        if (! empty($options['cache'])) {
+            $payload = $this->applyCacheControl($payload);
+        }
 
         $response = Http::withOptions(['stream' => true])
             ->withHeaders($this->headers($apiKey))
@@ -396,6 +403,48 @@ class ClaudeProvider extends AiProvider
             'anthropic-version' => self::ANTHROPIC_VERSION,
             'Content-Type' => 'application/json',
         ];
+    }
+
+    /**
+     * Zet prompt-caching breakpoints op de stabiele prefix van de payload.
+     *
+     * De prefix-volgorde bij Anthropic is tools -> system -> messages. We
+     * cachen de duurste herhaalde tokens door een ephemeral cache_control op
+     * de system-prompt en op de laatste tool-definitie te zetten. Een string
+     * system-prompt wordt naar het content-block formaat omgezet, want
+     * cache_control kan alleen op een blok staan, niet op een kale string.
+     *
+     * Let op: alleen inschakelen voor herhaalde calls met een identieke,
+     * stabiele prefix (zoals de livechat-agent). Bij one-shot calls levert
+     * het niets op en betaal je alleen de cache-write premie. De prefix moet
+     * minimaal ~2048 tokens zijn op Sonnet, anders cachet hij stilzwijgend
+     * niet.
+     */
+    protected function applyCacheControl(array $payload): array
+    {
+        if (! empty($payload['system'])) {
+            if (is_string($payload['system'])) {
+                $payload['system'] = [[
+                    'type' => 'text',
+                    'text' => $payload['system'],
+                    'cache_control' => ['type' => 'ephemeral'],
+                ]];
+            } elseif (is_array($payload['system'])) {
+                $lastKey = array_key_last($payload['system']);
+                if ($lastKey !== null && is_array($payload['system'][$lastKey])) {
+                    $payload['system'][$lastKey]['cache_control'] = ['type' => 'ephemeral'];
+                }
+            }
+        }
+
+        if (! empty($payload['tools']) && is_array($payload['tools'])) {
+            $lastKey = array_key_last($payload['tools']);
+            if ($lastKey !== null && is_array($payload['tools'][$lastKey])) {
+                $payload['tools'][$lastKey]['cache_control'] = ['type' => 'ephemeral'];
+            }
+        }
+
+        return $payload;
     }
 
     protected function request(string $prompt, array $options = []): ?string
