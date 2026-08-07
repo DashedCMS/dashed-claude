@@ -44,21 +44,32 @@ class ClaudeProvider extends AiProvider
             return false;
         }
 
-        return cache()->rememberForever('ai_connected_claude', function () use ($apiKey) {
-            try {
-                $response = Http::withHeaders($this->headers($apiKey))
-                    ->timeout(10)
-                    ->post('https://api.anthropic.com/v1/messages', [
-                        'model' => 'claude-haiku-4-5-20251001',
-                        'max_tokens' => 1,
-                        'messages' => [['role' => 'user', 'content' => 'Hi']],
-                    ]);
-            } catch (Exception) {
-                return false;
-            }
+        // Een positieve verbinding cachen we lang; een NEGATIEVE nooit blijvend.
+        // Anders zet één transiënte hik (time-out/5xx) 'niet verbonden' voor
+        // altijd vast en ligt de hele AI plat tot een handmatige cache:clear.
+        if (cache()->get('ai_connected_claude') === true) {
+            return true;
+        }
 
-            return $response->successful() || $response->status() === 429;
-        });
+        try {
+            $response = Http::withHeaders($this->headers($apiKey))
+                ->timeout(10)
+                ->post('https://api.anthropic.com/v1/messages', [
+                    'model' => 'claude-haiku-4-5-20251001',
+                    'max_tokens' => 1,
+                    'messages' => [['role' => 'user', 'content' => 'Hi']],
+                ]);
+        } catch (Exception) {
+            return false;
+        }
+
+        $connected = $response->successful() || $response->status() === 429;
+
+        // true → forever; false → korte TTL zodat het vanzelf herstelt zonder
+        // bij elke call opnieuw de API te bevragen.
+        cache()->put('ai_connected_claude', $connected, $connected ? null : now()->addSeconds(60));
+
+        return $connected;
     }
 
     public function text(string $prompt, array $options = []): ?string
