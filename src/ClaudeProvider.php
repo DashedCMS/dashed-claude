@@ -394,11 +394,11 @@ class ClaudeProvider extends AiProvider
     {
         return [
             TextInput::make('claude_api_key')
-                ->label('Claude API sleutel')
+                ->label(__('Claude API sleutel'))
                 ->password()
                 ->revealable()
-                ->placeholder('sk-ant-...')
-                ->helperText('Je vindt je API sleutel op console.anthropic.com → API Keys.'),
+                ->placeholder(__('sk-ant-...'))
+                ->helperText(__('Je vindt je API sleutel op console.anthropic.com → API Keys.')),
         ];
     }
 
