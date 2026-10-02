@@ -12,7 +12,8 @@ class DashedClaudeServiceProvider extends PackageServiceProvider
 
     public function configurePackage(Package $package): void
     {
-        $package->name(self::$name);
+        $package->name(self::$name)
+            ->hasTranslations();
     }
 
     public function bootingPackage(): void
