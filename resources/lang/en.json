@@ -1,1 +1,5 @@
-{}
+{
+    "Claude API sleutel": "Claude API key",
+    "Je vindt je API sleutel op console.anthropic.com → API Keys.": "You can find your API key at console.anthropic.com → API Keys.",
+    "sk-ant-...": "sk-ant-..."
+}
