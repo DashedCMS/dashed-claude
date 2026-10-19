@@ -2,6 +2,20 @@
 
 All notable changes to `dashed-claude` will be documented in this file.
 
+## v4.5.0 - 2026-10-19
+
+### Added
+- **Prompt caching voor het hele gesprek.** `'cache' => true` zet naast de breakpoints op system-prompt en laatste tool nu ook een top-level `cache_control` (automatische caching): het breakpoint schuift mee met het gesprek, zodat elke volgende beurt van een agent-loop ook de eerdere berichten en tool-resultaten uit de cache leest.
+- **1 uur-TTL.** `'cache' => '1h'` zet alle breakpoints op de TTL van een uur (schrijven kost 2× in plaats van 1,25×; alleen zinvol als er vaak meer dan 5 minuten tussen twee calls met dezelfde prefix zit).
+- **Cache-tellers in het verbruik.** `streamMessages()` geeft `cache_read_input_tokens` en `cache_creation_input_tokens` terug in `usage`, en de dag-/maandtellers (`ai_usage_claude_*`) houden beide bij. `input_tokens` telt alleen de niet-gecachete tokens.
+
+### Fixed
+- `messages()` telde zijn verbruik niet mee in de dag-/maandtellers; alleen `streamMessages()` deed dat.
+
+### Changed
+- **Elke aanroep in het AI-logboek.** `text()`, `json()`, `vision()`, `messages()` en `streamMessages()` loggen via `AiLogger` (dashed-ai) met model, tokens (ook cache), prompt en antwoord; een mislukte aanroep komt er als fout in. De dag- en maandtellers in `ai_usage_claude_*` blijven bestaan.
+
+
 ## v4.2.0 - 2026-06-24
 
 ### Added

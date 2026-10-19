@@ -5,6 +5,7 @@ namespace Dashed\DashedClaude;
 use Exception;
 use Dashed\DashedAi\AiProvider;
 use Illuminate\Support\Facades\Http;
+use Dashed\DashedAi\Logging\AiLogger;
 use Dashed\DashedAi\Enums\AiCapability;
 use Filament\Forms\Components\TextInput;
 use Dashed\DashedAi\Exceptions\AiException;
@@ -79,7 +80,7 @@ class ClaudeProvider extends AiProvider
 
     public function json(string $prompt, array $options = []): ?array
     {
-        $text = $this->request($prompt, $options);
+        $text = $this->request($prompt, $options + ['log_kind' => 'json']);
 
         if (! $text) {
             return null;
@@ -129,11 +130,15 @@ class ClaudeProvider extends AiProvider
             $body['system'] = $system;
         }
 
+        $log = AiLogger::begin('claude', 'vision', ['model' => $body['model'], 'prompt' => $body, 'options' => $options]);
+
         try {
             $response = Http::withHeaders($this->headers($apiKey))
                 ->timeout(120)
                 ->post('https://api.anthropic.com/v1/messages', $body);
-        } catch (Exception) {
+        } catch (Exception $e) {
+            $log->fail($e);
+
             return null;
         }
 
@@ -142,9 +147,12 @@ class ClaudeProvider extends AiProvider
                 $response->json('usage.input_tokens', 0),
                 $response->json('usage.output_tokens', 0),
             );
+            $log->model($response->json('model'))->usage($response->json('usage'))->response($response->json('content.0.text'))->succeed();
 
             return $response->json('content.0.text');
         }
+
+        $log->fail('HTTP ' . $response->status() . ' ' . ($response->json('error.message') ?? ''));
 
         if ($response->status() === 429) {
             throw new AiRateLimitException('Claude rate limit exceeded');
@@ -178,19 +186,39 @@ class ClaudeProvider extends AiProvider
             $payload['temperature'] = $options['temperature'];
         }
         if (! empty($options['cache'])) {
-            $payload = $this->applyCacheControl($payload);
+            $payload = $this->applyCacheControl($payload, $options['cache']);
         }
 
-        $response = Http::withHeaders($this->headers($apiKey))
-            ->timeout(120)
-            ->post('https://api.anthropic.com/v1/messages', $payload);
+        $log = AiLogger::begin('claude', 'messages', ['model' => $payload['model'], 'prompt' => $this->promptForLog($payload), 'options' => $options]);
+
+        try {
+            $response = Http::withHeaders($this->headers($apiKey))
+                ->timeout(120)
+                ->post('https://api.anthropic.com/v1/messages', $payload);
+        } catch (Exception $e) {
+            $log->fail($e);
+
+            throw $e;
+        }
 
         if ($response->status() === 429) {
+            $log->fail('HTTP 429 rate limit');
+
             throw new AiRateLimitException('Claude rate limit.');
         }
         if (! $response->successful()) {
+            $log->fail('HTTP ' . $response->status() . ' ' . ($response->json('error.message') ?? $response->body()));
+
             throw new AiException('Claude fout: ' . $response->status() . ' ' . $response->body());
         }
+
+        $this->trackUsage(
+            (int) $response->json('usage.input_tokens', 0),
+            (int) $response->json('usage.output_tokens', 0),
+            (int) $response->json('usage.cache_read_input_tokens', 0),
+            (int) $response->json('usage.cache_creation_input_tokens', 0),
+        );
+        $log->model($response->json('model'))->usage($response->json('usage'))->response($response->json('content'))->succeed();
 
         return $response->json();
     }
@@ -214,18 +242,30 @@ class ClaudeProvider extends AiProvider
         ], fn ($v) => $v !== null);
 
         if (! empty($options['cache'])) {
-            $payload = $this->applyCacheControl($payload);
+            $payload = $this->applyCacheControl($payload, $options['cache']);
         }
 
-        $response = Http::withOptions(['stream' => true])
-            ->withHeaders($this->headers($apiKey))
-            ->timeout(120)
-            ->post('https://api.anthropic.com/v1/messages', $payload);
+        $log = AiLogger::begin('claude', 'stream', ['model' => $payload['model'], 'prompt' => $this->promptForLog($payload), 'options' => $options]);
+
+        try {
+            $response = Http::withOptions(['stream' => true])
+                ->withHeaders($this->headers($apiKey))
+                ->timeout(120)
+                ->post('https://api.anthropic.com/v1/messages', $payload);
+        } catch (Exception $e) {
+            $log->fail($e);
+
+            throw $e;
+        }
 
         if ($response->status() === 429) {
+            $log->fail('HTTP 429 rate limit');
+
             throw new AiRateLimitException('Claude stream rate limit.');
         }
         if (! $response->successful()) {
+            $log->fail('HTTP ' . $response->status());
+
             throw new AiException('Claude stream fout: ' . $response->status());
         }
 
@@ -293,7 +333,13 @@ class ClaudeProvider extends AiProvider
             'usage' => $state['usage'],
         ];
 
-        $this->trackUsage($result['usage']['input_tokens'] ?? 0, $result['usage']['output_tokens'] ?? 0);
+        $this->trackUsage(
+            $result['usage']['input_tokens'] ?? 0,
+            $result['usage']['output_tokens'] ?? 0,
+            $result['usage']['cache_read_input_tokens'] ?? 0,
+            $result['usage']['cache_creation_input_tokens'] ?? 0,
+        );
+        $log->usage($result['usage'])->response($content)->succeed();
 
         return $result;
     }
@@ -317,6 +363,11 @@ class ClaudeProvider extends AiProvider
         switch ($data['type'] ?? null) {
             case 'message_start':
                 $state['usage']['input_tokens'] = $data['message']['usage']['input_tokens'] ?? 0;
+                foreach (['cache_read_input_tokens', 'cache_creation_input_tokens'] as $key) {
+                    if (isset($data['message']['usage'][$key])) {
+                        $state['usage'][$key] = (int) $data['message']['usage'][$key];
+                    }
+                }
 
                 break;
             case 'content_block_start':
@@ -417,33 +468,50 @@ class ClaudeProvider extends AiProvider
     }
 
     /**
-     * Zet prompt-caching breakpoints op de stabiele prefix van de payload.
+     * Zet prompt-caching breakpoints op de payload.
      *
-     * De prefix-volgorde bij Anthropic is tools -> system -> messages. We
-     * cachen de duurste herhaalde tokens door een ephemeral cache_control op
-     * de system-prompt en op de laatste tool-definitie te zetten. Een string
-     * system-prompt wordt naar het content-block formaat omgezet, want
-     * cache_control kan alleen op een blok staan, niet op een kale string.
+     * De prefix-volgorde bij Anthropic is tools -> system -> messages. Er
+     * komen twee soorten breakpoints:
      *
-     * Let op: alleen inschakelen voor herhaalde calls met een identieke,
-     * stabiele prefix (zoals de livechat-agent). Bij one-shot calls levert
-     * het niets op en betaal je alleen de cache-write premie. De prefix moet
-     * minimaal ~2048 tokens zijn op Sonnet, anders cachet hij stilzwijgend
-     * niet.
+     * 1. Expliciet op het laatste system-blok en de laatste tool-definitie:
+     *    de vaste prefix houdt zo een gegarandeerd leespunt, wat er verderop
+     *    in het gesprek ook gebeurt. Een string system-prompt wordt naar het
+     *    content-block formaat omgezet, want cache_control kan alleen op een
+     *    blok staan.
+     * 2. Top-level cache_control (automatische caching): Anthropic zet het
+     *    breakpoint op het laatste cachebare blok en schuift het mee met het
+     *    gesprek. In een agent-loop leest elke volgende beurt daardoor ook de
+     *    eerdere berichten en tool-resultaten uit de cache.
+     *
+     * $cache is true (5 minuten) of '1h'. Neem '1h' alleen als er tussen twee
+     * calls met dezelfde prefix vaak meer dan 5 minuten zit: schrijven kost
+     * dan 2x de inputprijs in plaats van 1,25x. Alle breakpoints krijgen
+     * dezelfde TTL, want een langere TTL mag niet na een kortere komen.
+     *
+     * Let op: alleen inschakelen voor herhaalde calls met een stabiele prefix
+     * (zoals de livechat-agent). Bij one-shot calls betaal je alleen de
+     * schrijfpremie. Een prefix onder het minimum van het model (512 tot 4096
+     * tokens) cachet stilzwijgend niet; controleer met
+     * usage.cache_read_input_tokens.
      */
-    protected function applyCacheControl(array $payload): array
+    protected function applyCacheControl(array $payload, bool|string $cache = true): array
     {
+        $cacheControl = ['type' => 'ephemeral'];
+        if ($cache === '1h') {
+            $cacheControl['ttl'] = '1h';
+        }
+
         if (! empty($payload['system'])) {
             if (is_string($payload['system'])) {
                 $payload['system'] = [[
                     'type' => 'text',
                     'text' => $payload['system'],
-                    'cache_control' => ['type' => 'ephemeral'],
+                    'cache_control' => $cacheControl,
                 ]];
             } elseif (is_array($payload['system'])) {
                 $lastKey = array_key_last($payload['system']);
                 if ($lastKey !== null && is_array($payload['system'][$lastKey])) {
-                    $payload['system'][$lastKey]['cache_control'] = ['type' => 'ephemeral'];
+                    $payload['system'][$lastKey]['cache_control'] = $cacheControl;
                 }
             }
         }
@@ -451,9 +519,11 @@ class ClaudeProvider extends AiProvider
         if (! empty($payload['tools']) && is_array($payload['tools'])) {
             $lastKey = array_key_last($payload['tools']);
             if ($lastKey !== null && is_array($payload['tools'][$lastKey])) {
-                $payload['tools'][$lastKey]['cache_control'] = ['type' => 'ephemeral'];
+                $payload['tools'][$lastKey]['cache_control'] = $cacheControl;
             }
         }
+
+        $payload['cache_control'] = $cacheControl;
 
         return $payload;
     }
@@ -480,21 +550,31 @@ class ClaudeProvider extends AiProvider
             $body['system'] = $system;
         }
 
-        $response = Http::withHeaders($this->headers($apiKey))
-            ->timeout(120)
-            ->post('https://api.anthropic.com/v1/messages', $body);
+        $log = AiLogger::begin('claude', $options['log_kind'] ?? 'text', ['model' => $body['model'], 'prompt' => $this->promptForLog($body), 'options' => $options]);
+
+        try {
+            $response = Http::withHeaders($this->headers($apiKey))
+                ->timeout(120)
+                ->post('https://api.anthropic.com/v1/messages', $body);
+        } catch (Exception $e) {
+            $log->fail($e);
+
+            throw $e;
+        }
 
         if ($response->successful()) {
             $this->trackUsage(
                 $response->json('usage.input_tokens', 0),
                 $response->json('usage.output_tokens', 0),
             );
+            $log->model($response->json('model'))->usage($response->json('usage'))->response($response->json('content.0.text'))->succeed();
 
             return $response->json('content.0.text');
         }
 
         $errorMessage = $response->json('error.message') ?? $response->body();
         $errorType = $response->json('error.type') ?? 'http_' . $response->status();
+        $log->fail("[{$errorType}] {$errorMessage}");
 
         if ($response->status() === 429 || $errorType === 'rate_limit_error') {
             throw new AiRateLimitException("[{$errorType}] {$errorMessage}");
@@ -503,20 +583,37 @@ class ClaudeProvider extends AiProvider
         throw new AiException("[{$errorType}] {$errorMessage}");
     }
 
-    protected function trackUsage(int $inputTokens, int $outputTokens): void
+    /**
+     * Wat er in het logboek komt als prompt: system-prompt en berichten, zonder
+     * tool-definities (die staan al als namen in de opties).
+     */
+    protected function promptForLog(array $payload): array
     {
-        $dayKey = 'ai_usage_claude_day_' . now()->format('Y_m_d');
-        $day = Customsetting::get($dayKey, null, []) ?: [];
-        $day['input_tokens'] = ($day['input_tokens'] ?? 0) + $inputTokens;
-        $day['output_tokens'] = ($day['output_tokens'] ?? 0) + $outputTokens;
-        $day['calls'] = ($day['calls'] ?? 0) + 1;
-        Customsetting::set($dayKey, $day);
+        return array_filter([
+            'system' => $payload['system'] ?? null,
+            'messages' => $payload['messages'] ?? null,
+        ], fn ($v) => $v !== null);
+    }
 
-        $monthKey = 'ai_usage_claude_' . now()->format('Y_m');
-        $month = Customsetting::get($monthKey, null, []) ?: [];
-        $month['input_tokens'] = ($month['input_tokens'] ?? 0) + $inputTokens;
-        $month['output_tokens'] = ($month['output_tokens'] ?? 0) + $outputTokens;
-        $month['calls'] = ($month['calls'] ?? 0) + 1;
-        Customsetting::set($monthKey, $month);
+    /**
+     * input_tokens telt alleen de niet-gecachete tokens; wat uit de cache
+     * kwam of ernaartoe geschreven is staat in de twee cache-tellers.
+     */
+    protected function trackUsage(int $inputTokens, int $outputTokens, int $cacheReadTokens = 0, int $cacheWriteTokens = 0): void
+    {
+        $keys = [
+            'ai_usage_claude_day_' . now()->format('Y_m_d'),
+            'ai_usage_claude_' . now()->format('Y_m'),
+        ];
+
+        foreach ($keys as $key) {
+            $usage = Customsetting::get($key, null, []) ?: [];
+            $usage['input_tokens'] = ($usage['input_tokens'] ?? 0) + $inputTokens;
+            $usage['output_tokens'] = ($usage['output_tokens'] ?? 0) + $outputTokens;
+            $usage['cache_read_input_tokens'] = ($usage['cache_read_input_tokens'] ?? 0) + $cacheReadTokens;
+            $usage['cache_creation_input_tokens'] = ($usage['cache_creation_input_tokens'] ?? 0) + $cacheWriteTokens;
+            $usage['calls'] = ($usage['calls'] ?? 0) + 1;
+            Customsetting::set($key, $usage);
+        }
     }
 }
